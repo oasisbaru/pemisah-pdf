@@ -139,12 +139,17 @@
     <div id="formBox">
       <div class="rows" id="rows"></div>
       <div class="actions" style="margin-top:10px"><button type="button" id="add">+ Tambah bagian</button></div>
-      <p class="hint" style="margin:8px 0 0">Halaman: <code>1-3</code> <code>5</code> <code>7-9, 12</code> <code>15-</code> (15 sampai akhir)</p>
+      <p class="hint" style="margin:8px 0 0">Halaman: <code>1-3</code> <code>5</code> <code>7-9, 12</code> <code>15-</code> (15 sampai akhir). Untuk melewati halaman tertentu: <code>1-30 kecuali 5, 10-12</code> atau <code>semua kecuali 1</code>.</p>
     </div>
 
     <div id="textBox" hidden>
       <label class="lbl" for="text">Satu bagian per baris, format <code>Nama: halaman</code> (nama boleh dihapus). Baris berawalan # diabaikan.</label>
       <textarea id="text" spellcheck="false" placeholder="Cover: 1&#10;Bab 1: 2-15&#10;Bab 2: 16-30&#10;Lampiran: 31-"></textarea>
+    </div>
+
+    <div>
+      <label class="lbl" for="exclude">Kecualikan halaman dari semua bagian (opsional)</label>
+      <input type="text" id="exclude" class="mono" placeholder="mis. 1, 4, 20-22" autocomplete="off">
     </div>
 
     <div class="preview" id="preview" aria-live="polite"></div>
@@ -209,9 +214,10 @@ var Core = (function () {
     }
     return out.join(',');
   }
-  function parseSpec(spec, total) {
+  function parseBase(spec, total) {
     var t = String(spec).trim(), l = t.toLowerCase(), m, n;
     if (!t) return { error: 'Isi nomor halaman atau pola.' };
+    if (l === 'semua') return { parts: [{ pages: range(0, total - 1), label: 'semua' }] };
     if ((m = l.match(/^tiap\s+(\d+)(\s+halaman)?$/))) {
       n = parseInt(m[1], 10);
       if (n < 1) return { error: 'Angka setelah "tiap" minimal 1.' };
@@ -252,21 +258,58 @@ var Core = (function () {
     if (!out.length) return { error: 'Isi nomor halaman atau pola.' };
     return { parts: [{ pages: out, label: t.replace(/\s+/g, '') }] };
   }
-  // entries: [{key, where, name, spec}] -> {jobs, errors}
-  function buildJobs(entries, total) {
-    var jobs = [], errors = [], n = 0;
+  var EXC_RE = /\s*\b(?:kecuali|except)\b\s*/i;
+  function excludeSet(text, total) {
+    var res = parseBase(text, total);
+    if (res.error) return { error: res.error };
+    var set = {};
+    res.parts.forEach(function (p) { p.pages.forEach(function (i) { set[i] = true; }); });
+    return { set: set };
+  }
+  // "1-30 kecuali 5, 10-12" -> bagian tanpa halaman yang dikecualikan. globalSet opsional (indeks basis 0).
+  function parseSpec(spec, total, globalSet) {
+    var bits = String(spec).trim().split(EXC_RE), head = bits[0].trim(), set = {}, has = false, k;
+    if (bits.length > 2) return { error: 'Pakai satu kata "kecuali" saja per bagian.' };
+    if (bits.length === 2) {
+      if (!bits[1].trim()) return { error: 'Tulis halaman setelah "kecuali".' };
+      var ex = excludeSet(bits[1], total);
+      if (ex.error) return { error: ex.error };
+      for (k in ex.set) set[k] = true;
+      has = true;
+      if (!head) head = 'semua';
+    }
+    if (globalSet) { for (k in globalSet) { set[k] = true; has = true; } }
+    var res = parseBase(head, total);
+    if (res.error || !has) return res;
+    var parts = [];
+    res.parts.forEach(function (p) {
+      var keep = p.pages.filter(function (i) { return !set[i]; });
+      if (!keep.length) return;
+      parts.push(keep.length === p.pages.length ? p : { pages: keep, label: runs(keep) });
+    });
+    return { parts: parts };
+  }
+  // entries: [{key, where, name, spec}] -> {jobs, errors, skipped, exCount}
+  function buildJobs(entries, total, globalEx) {
+    var jobs = [], errors = [], skipped = [], n = 0, gset = null, exCount = 0;
+    if (String(globalEx || '').trim()) {
+      var g = excludeSet(globalEx, total);
+      if (g.error) return { jobs: [], errors: [{ key: 'exclude', where: 'Kecualikan', msg: g.error }], skipped: [], exCount: 0 };
+      gset = g.set; exCount = Object.keys(gset).length;
+    }
     entries.forEach(function (e) {
       var name = (e.name || '').trim();
       if (!String(e.spec).trim() && !name) return;
-      var res = parseSpec(e.spec, total);
+      var res = parseSpec(e.spec, total, gset);
       if (res.error) { errors.push({ key: e.key, where: e.where, msg: res.error }); return; }
+      if (!res.parts.length) { skipped.push(name || e.where); return; }
       res.parts.forEach(function (p, i) {
         n++;
         var nm = res.parts.length > 1 ? (name || 'bagian') + '-' + (i + 1) : (name || 'bagian-' + n);
         jobs.push({ name: nm, pages: p.pages, label: p.label, key: e.key, no: n });
       });
     });
-    return { jobs: jobs, errors: errors };
+    return { jobs: jobs, errors: errors, skipped: skipped, exCount: exCount };
   }
   function textToEntries(text) {
     var out = [];
@@ -309,7 +352,8 @@ if (typeof module !== 'undefined') module.exports = Core;
     { name: 'Contoh: cover, bab, lampiran', text: 'Cover: 1\nBab 1: 2-15\nBab 2: 16-30\nLampiran: 31-' },
     { name: 'Tiap 5 halaman', text: 'tiap 5' },
     { name: 'Bagi 3 sama rata', text: 'bagi 3' },
-    { name: 'Ganjil dan genap', text: 'Halaman ganjil: ganjil\nHalaman genap: genap' }
+    { name: 'Ganjil dan genap', text: 'Halaman ganjil: ganjil\nHalaman genap: genap' },
+    { name: 'Semua kecuali halaman 1', text: 'Isi: semua kecuali 1' }
   ];
   var KEY_T = 'pemisahpdf.templates', KEY_S = 'pemisahpdf.settings';
   var LS = {
@@ -384,7 +428,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     });
   }
 
-  function compute() { return C.buildJobs(entries(), state.total); }
+  function compute() { return C.buildJobs(entries(), state.total, $('exclude').value); }
 
   function refreshPreview() {
     var box = $('preview'); box.textContent = '';
@@ -394,11 +438,11 @@ if (typeof module !== 'undefined') module.exports = Core;
     var res = compute();
     res.errors.forEach(function (er) {
       var d = document.createElement('div'); d.className = 'e'; d.textContent = er.where + ': ' + er.msg; box.appendChild(d);
-      var el = $(er.key + '-r'); if (el) el.classList.add('bad');
+      var el = er.key === 'exclude' ? $('exclude') : $(er.key + '-r'); if (el) el.classList.add('bad');
     });
-    if (!res.jobs.length && !res.errors.length) { var e0 = document.createElement('div'); e0.className = 'hint'; e0.textContent = 'Belum ada bagian. Isi halaman atau pola dulu.'; box.appendChild(e0); return; }
+    if (!res.jobs.length && !res.errors.length) { var e0 = document.createElement('div'); e0.className = 'hint'; e0.textContent = res.skipped.length ? 'Semua halaman bagian ini ada di daftar kecuali, jadi tidak ada file yang dibuat.' : 'Belum ada bagian. Isi halaman atau pola dulu.'; box.appendChild(e0); return; }
     if (res.jobs.length) {
-      var h = document.createElement('div'); h.className = 'hint'; h.textContent = res.jobs.length + ' file akan dibuat dari ' + state.total + ' halaman:'; box.appendChild(h);
+      var h = document.createElement('div'); h.className = 'hint'; h.textContent = res.jobs.length + ' file akan dibuat dari ' + state.total + ' halaman' + (res.exCount ? ' (' + res.exCount + ' halaman dikecualikan)' : '') + ':'; box.appendChild(h);
       res.jobs.slice(0, 30).forEach(function (j) {
         var d = document.createElement('div'); d.className = 'j';
         var a = document.createElement('span'); a.textContent = j.name;
@@ -407,6 +451,7 @@ if (typeof module !== 'undefined') module.exports = Core;
       });
       if (res.jobs.length > 30) { var m = document.createElement('div'); m.className = 'hint'; m.textContent = 'dan ' + (res.jobs.length - 30) + ' file lainnya'; box.appendChild(m); }
     }
+    if (res.skipped.length && res.jobs.length) { var sk = document.createElement('div'); sk.className = 'hint'; sk.textContent = 'Dilewati karena semua halamannya dikecualikan: ' + res.skipped.join(', '); box.appendChild(sk); }
   }
 
   // ---------- Berkas dan proses ----------
@@ -434,7 +479,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     if (!state.buf) return;
     var res = compute();
     if (res.errors.length) { setStatus('Perbaiki dulu baris yang bertanda merah.', 'bad'); return; }
-    if (!res.jobs.length) { setStatus('Isi minimal satu bagian.', 'bad'); return; }
+    if (!res.jobs.length) { setStatus(res.skipped.length ? 'Semua halaman bagian ada di daftar kecuali, tidak ada yang bisa dipisah.' : 'Isi minimal satu bagian.', 'bad'); return; }
     $('split').disabled = true; setStatus('Memproses ' + res.jobs.length + ' file...', '');
     var pattern = $('fpattern').value;
     PDFLib.PDFDocument.load(state.buf).then(function (src) {
@@ -507,6 +552,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   function applyTemplate(t) {
     if (!t) return;
     if (typeof t.fname === 'string' && t.fname) $('fpattern').value = t.fname;
+    $('exclude').value = t.ex || '';
     settings.fpattern = $('fpattern').value; saveSettings();
     setFromText(t.text);
   }
@@ -514,7 +560,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   function b64d(s) { var bin = atob(s.replace(/-/g, '+').replace(/_/g, '/')), by = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) by[i] = bin.charCodeAt(i); return new TextDecoder().decode(by); }
   function cleanTpl(t) {
     if (!t || typeof t.text !== 'string') return null;
-    return { name: String(t.name || t.n || 'Template').slice(0, 80), text: t.text.slice(0, 5000), fname: typeof t.fname === 'string' ? t.fname.slice(0, 150) : '' };
+    return { name: String(t.name || t.n || 'Template').slice(0, 80), text: t.text.slice(0, 5000), fname: typeof t.fname === 'string' ? t.fname.slice(0, 150) : '', ex: typeof t.ex === 'string' ? t.ex.slice(0, 300) : '' };
   }
 
   $('tplSelect').addEventListener('change', function () {
@@ -525,7 +571,7 @@ if (typeof module !== 'undefined') module.exports = Core;
     var name = $('tplName').value.trim(), text = currentText().trim();
     if (!name) { setStatus('Beri nama template dulu.', 'bad'); $('tplName').focus(); return; }
     if (!text) { setStatus('Pembagiannya masih kosong, tidak ada yang disimpan.', 'bad'); return; }
-    var t = { name: name, text: text, fname: $('fpattern').value.trim() };
+    var t = { name: name, text: text, fname: $('fpattern').value.trim(), ex: $('exclude').value.trim() };
     var idx = userTpl.findIndex(function (x) { return x.name === name; });
     if (idx >= 0) userTpl[idx] = t; else userTpl.push(t);
     LS.set(KEY_T, userTpl);
@@ -540,7 +586,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   $('tplExport').addEventListener('click', function () {
     var text = currentText().trim();
     if (!text) { setStatus('Pembagiannya masih kosong.', 'bad'); return; }
-    var t = { name: $('tplName').value.trim() || 'Template', text: text, fname: $('fpattern').value.trim() };
+    var t = { name: $('tplName').value.trim() || 'Template', text: text, fname: $('fpattern').value.trim(), ex: $('exclude').value.trim() };
     dl(new Blob([JSON.stringify(t, null, 2)], { type: 'application/json' }), C.slug(t.name).toLowerCase() + '.template.json');
     setStatus('Template diekspor.', 'ok');
   });
@@ -559,7 +605,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   $('tplLink').addEventListener('click', function () {
     var text = currentText().trim();
     if (!text) { setStatus('Pembagiannya masih kosong.', 'bad'); return; }
-    var payload = { n: $('tplName').value.trim() || 'Template dari link', t: text, f: $('fpattern').value.trim() };
+    var payload = { n: $('tplName').value.trim() || 'Template dari link', t: text, f: $('fpattern').value.trim(), e: $('exclude').value.trim() };
     var url = location.href.split('#')[0] + '#t=' + b64e(JSON.stringify(payload));
     var out = $('linkout'); out.hidden = false; out.value = url; out.focus(); out.select();
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -569,7 +615,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   function applyHash() {
     var m = location.hash.match(/^#t=(.+)$/); if (!m) return;
     try {
-      var p = JSON.parse(b64d(m[1])), t = cleanTpl({ name: p.n, text: p.t, fname: p.f });
+      var p = JSON.parse(b64d(m[1])), t = cleanTpl({ name: p.n, text: p.t, fname: p.f, ex: p.e });
       if (t) { settings.mode = 'text'; saveSettings(); renderMode(); applyTemplate(t); $('tplName').value = t.name; setStatus('Template "' + t.name + '" dimuat dari link. Pilih PDF lalu pisahkan, atau simpan templatenya.', 'ok'); }
     } catch (e) { setStatus('Link template tidak valid.', 'bad'); }
   }
@@ -587,6 +633,7 @@ if (typeof module !== 'undefined') module.exports = Core;
   $('modeText').addEventListener('click', function () { setMode('text'); });
   $('add').addEventListener('click', function () { state.rows.push(newRow('', '')); renderRows(); refreshPreview(); var l = state.rows[state.rows.length - 1]; $(l.id + '-r').focus(); });
   $('text').addEventListener('input', refreshPreview);
+  $('exclude').addEventListener('input', refreshPreview);
   $('split').addEventListener('click', doSplit);
   $('zip').addEventListener('click', doZip);
   $('autoZip').addEventListener('change', function () { settings.auto = this.checked; saveSettings(); });
